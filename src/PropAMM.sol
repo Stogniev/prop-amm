@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 interface IGlobalStorage {
     function set(bytes32 key, bytes32 value) external;
@@ -40,9 +41,12 @@ contract PropAMM is Ownable, ReentrancyGuard {
     }
 
     struct PairParameters {
-        uint256 concentration; // Concentration parameter for the curve
-        uint256 multX; // Price multiplier for token X
-        uint256 multY; // Price multiplier for token Y
+        uint256 concentration; // Concentration parameter for the curve (scaled by 1e6)
+        uint256 multX; // Price multiplier for token X (scaled by 1e18)
+        uint256 multY; // Price multiplier for token Y (scaled by 1e18)
+        uint256 baseInvariant; // Baseline invariant constant for the curve
+        uint256 feeRate; // Fee charged on each trade (scaled by 1e6)
+        uint256 spread; // Additional spread applied to trades (scaled by 1e6)
     }
 
     // ============ State Variables ============
@@ -53,12 +57,21 @@ contract PropAMM is Ownable, ReentrancyGuard {
     mapping(bytes32 => TradingPair) public pairs;
     bytes32[] public pairIds;
 
+    // ============ Mathematical Constants ============
+
+    uint256 private constant MULTIPLIER_SCALE = 1e18;
+    uint256 private constant CONCENTRATION_BASE = 1e6;
+    uint256 private constant FEE_BASE = 1e6;
+
     // ============ Constants for GlobalStorage Keys ============
 
     // Key prefixes for different parameters in GlobalStorage
     bytes32 private constant CONCENTRATION_PREFIX = keccak256("CONCENTRATION");
     bytes32 private constant MULT_X_PREFIX = keccak256("MULT_X");
     bytes32 private constant MULT_Y_PREFIX = keccak256("MULT_Y");
+    bytes32 private constant BASE_INVARIANT_PREFIX = keccak256("BASE_INVARIANT");
+    bytes32 private constant FEE_PREFIX = keccak256("FEE_RATE");
+    bytes32 private constant SPREAD_PREFIX = keccak256("SPREAD");
 
     // ============ Events ============
 
@@ -77,7 +90,15 @@ contract PropAMM is Ownable, ReentrancyGuard {
         uint256 amountOut
     );
 
-    event ParametersUpdated(bytes32 indexed pairId, uint256 concentration, uint256 multX, uint256 multY);
+    event ParametersUpdated(
+        bytes32 indexed pairId,
+        uint256 concentration,
+        uint256 multX,
+        uint256 multY,
+        uint256 baseInvariant,
+        uint256 feeRate,
+        uint256 spread
+    );
 
     event PairUnlocked(bytes32 indexed pairId);
 
@@ -133,7 +154,9 @@ contract PropAMM is Ownable, ReentrancyGuard {
         bytes32 pairId = keccak256(abi.encodePacked(tokenX, tokenY));
 
         if (pairs[pairId].exists) revert PairAlreadyExists();
-        if (initialConcentration < 1 || initialConcentration >= 2000) revert InvalidConcentration();
+        if (initialConcentration < CONCENTRATION_BASE || initialConcentration > CONCENTRATION_BASE * 100) {
+            revert InvalidConcentration();
+        }
 
         // Verify decimal configuration
         uint8 decimalsX = IERC20Metadata(tokenX).decimals();
@@ -161,8 +184,11 @@ contract PropAMM is Ownable, ReentrancyGuard {
         _updateParametersInGlobalStorage(
             pairId,
             initialConcentration,
-            0, // multX initialized to 0
-            0 // multY initialized to 0
+            MULTIPLIER_SCALE,
+            MULTIPLIER_SCALE,
+            0,
+            0,
+            0
         );
 
         emit PairCreated(pairId, tokenX, tokenY, initialConcentration);
@@ -177,18 +203,30 @@ contract PropAMM is Ownable, ReentrancyGuard {
      * @param multX New X multiplier
      * @param multY New Y multiplier
      */
-    function updateParameters(bytes32 pairId, uint256 concentration, uint256 multX, uint256 multY)
+    function updateParameters(
+        bytes32 pairId,
+        uint256 concentration,
+        uint256 multX,
+        uint256 multY,
+        uint256 baseInvariant,
+        uint256 feeRate,
+        uint256 spread
+    )
         external
         onlyMarketMaker
         pairExists(pairId)
     {
-        if (concentration < 1 || concentration >= 2000) {
+        if (concentration < CONCENTRATION_BASE || concentration > CONCENTRATION_BASE * 100) {
             revert InvalidConcentration();
         }
 
-        _updateParametersInGlobalStorage(pairId, concentration, multX, multY);
+        if (multX == 0 || multY == 0) revert InvalidAmount();
+        if (feeRate > FEE_BASE || spread > FEE_BASE) revert InvalidAmount();
+        if (feeRate + spread > FEE_BASE) revert InvalidAmount();
 
-        emit ParametersUpdated(pairId, concentration, multX, multY);
+        _updateParametersInGlobalStorage(pairId, concentration, multX, multY, baseInvariant, feeRate, spread);
+
+        emit ParametersUpdated(pairId, concentration, multX, multY, baseInvariant, feeRate, spread);
     }
 
     /**
@@ -278,6 +316,8 @@ contract PropAMM is Ownable, ReentrancyGuard {
         if (_isTargetYLocked(pairId, params)) revert PairLocked();
 
         // Get quote using GlobalStorage parameters
+        if (amountXIn == 0) revert InvalidAmount();
+
         uint256 amountOut = _quoteXtoY(pairId, amountXIn, params);
 
         if (amountOut < minAmountYOut) revert SlippageExceeded();
@@ -317,6 +357,8 @@ contract PropAMM is Ownable, ReentrancyGuard {
         if (_isTargetYLocked(pairId, params)) revert PairLocked();
 
         // Get quote using GlobalStorage parameters
+        if (amountYIn == 0) revert InvalidAmount();
+
         uint256 amountOut = _quoteYtoX(pairId, amountYIn, params);
 
         if (amountOut < minAmountXOut) revert SlippageExceeded();
@@ -409,10 +451,11 @@ contract PropAMM is Ownable, ReentrancyGuard {
      */
     function _readParametersFromGlobalStorage(bytes32 pairId) internal view returns (PairParameters memory params) {
         params.concentration = uint256(globalStorage.get(address(this), _getStorageKey(pairId, CONCENTRATION_PREFIX)));
-
         params.multX = uint256(globalStorage.get(address(this), _getStorageKey(pairId, MULT_X_PREFIX)));
-
         params.multY = uint256(globalStorage.get(address(this), _getStorageKey(pairId, MULT_Y_PREFIX)));
+        params.baseInvariant = uint256(globalStorage.get(address(this), _getStorageKey(pairId, BASE_INVARIANT_PREFIX)));
+        params.feeRate = uint256(globalStorage.get(address(this), _getStorageKey(pairId, FEE_PREFIX)));
+        params.spread = uint256(globalStorage.get(address(this), _getStorageKey(pairId, SPREAD_PREFIX)));
 
         return params;
     }
@@ -420,11 +463,17 @@ contract PropAMM is Ownable, ReentrancyGuard {
     /**
      * @notice Update parameters in GlobalStorage atomically
      */
-    function _updateParametersInGlobalStorage(bytes32 pairId, uint256 concentration, uint256 multX, uint256 multY)
-        internal
-    {
-        bytes32[] memory keys = new bytes32[](3);
-        bytes32[] memory values = new bytes32[](3);
+    function _updateParametersInGlobalStorage(
+        bytes32 pairId,
+        uint256 concentration,
+        uint256 multX,
+        uint256 multY,
+        uint256 baseInvariant,
+        uint256 feeRate,
+        uint256 spread
+    ) internal {
+        bytes32[] memory keys = new bytes32[](6);
+        bytes32[] memory values = new bytes32[](6);
 
         keys[0] = _getStorageKey(pairId, CONCENTRATION_PREFIX);
         values[0] = bytes32(concentration);
@@ -434,6 +483,15 @@ contract PropAMM is Ownable, ReentrancyGuard {
 
         keys[2] = _getStorageKey(pairId, MULT_Y_PREFIX);
         values[2] = bytes32(multY);
+
+        keys[3] = _getStorageKey(pairId, BASE_INVARIANT_PREFIX);
+        values[3] = bytes32(baseInvariant);
+
+        keys[4] = _getStorageKey(pairId, FEE_PREFIX);
+        values[4] = bytes32(feeRate);
+
+        keys[5] = _getStorageKey(pairId, SPREAD_PREFIX);
+        values[5] = bytes32(spread);
 
         globalStorage.setBatch(keys, values);
     }
@@ -454,13 +512,34 @@ contract PropAMM is Ownable, ReentrancyGuard {
         returns (uint256 amountOut)
     {
         TradingPair storage pair = pairs[pairId];
+        if (params.concentration < CONCENTRATION_BASE) revert StaleParameters();
+        if (params.multX == 0 || params.multY == 0) revert StaleParameters();
 
-        uint256 v0 = pair.targetX * params.concentration;
-        uint256 K = (v0 * v0 * params.multX) / params.multY;
+        uint256 effectiveXBefore = _effectiveAmount(pair.reserveX, params.multX);
+        uint256 effectiveYBefore = _effectiveAmount(pair.reserveY, params.multY);
+        if (effectiveYBefore == 0) revert InsufficientLiquidity();
 
-        uint256 base = v0 + pair.reserveX - pair.targetX;
+        uint256 invariant = params.baseInvariant;
+        if (invariant == 0) {
+            invariant = Math.mulDiv(effectiveXBefore, effectiveYBefore, 1);
+        }
 
-        amountOut = K / base - K / (base + amountXIn);
+        uint256 adjustedIn = _adjustInputForConcentration(
+            _effectiveAmount(amountXIn, params.multX),
+            params.concentration
+        );
+
+        uint256 newEffectiveX = effectiveXBefore + adjustedIn;
+        if (newEffectiveX == 0) revert InvalidAmount();
+
+        uint256 newEffectiveY = invariant / newEffectiveX;
+        if (newEffectiveY >= effectiveYBefore) revert InsufficientLiquidity();
+
+        uint256 rawEffectiveOut = effectiveYBefore - newEffectiveY;
+        uint256 adjustedEffectiveOut = _adjustOutputForConcentration(rawEffectiveOut, params.concentration);
+
+        amountOut = _reverseEffectiveAmount(adjustedEffectiveOut, params.multY);
+        amountOut = _applyFees(amountOut, params.feeRate, params.spread);
     }
 
     /**
@@ -472,13 +551,34 @@ contract PropAMM is Ownable, ReentrancyGuard {
         returns (uint256 amountOut)
     {
         TradingPair storage pair = pairs[pairId];
+        if (params.concentration < CONCENTRATION_BASE) revert StaleParameters();
+        if (params.multX == 0 || params.multY == 0) revert StaleParameters();
 
-        uint256 v0 = pair.targetX * params.concentration;
-        uint256 K = (v0 * v0 * params.multX) / params.multY;
+        uint256 effectiveXBefore = _effectiveAmount(pair.reserveX, params.multX);
+        uint256 effectiveYBefore = _effectiveAmount(pair.reserveY, params.multY);
+        if (effectiveXBefore == 0) revert InsufficientLiquidity();
 
-        uint256 base = v0 + pair.reserveX - pair.targetX;
+        uint256 invariant = params.baseInvariant;
+        if (invariant == 0) {
+            invariant = Math.mulDiv(effectiveXBefore, effectiveYBefore, 1);
+        }
 
-        amountOut = base - K / (K / base + amountYIn);
+        uint256 adjustedIn = _adjustInputForConcentration(
+            _effectiveAmount(amountYIn, params.multY),
+            params.concentration
+        );
+
+        uint256 newEffectiveY = effectiveYBefore + adjustedIn;
+        if (newEffectiveY == 0) revert InvalidAmount();
+
+        uint256 newEffectiveX = invariant / newEffectiveY;
+        if (newEffectiveX >= effectiveXBefore) revert InsufficientLiquidity();
+
+        uint256 rawEffectiveOut = effectiveXBefore - newEffectiveX;
+        uint256 adjustedEffectiveOut = _adjustOutputForConcentration(rawEffectiveOut, params.concentration);
+
+        amountOut = _reverseEffectiveAmount(adjustedEffectiveOut, params.multX);
+        amountOut = _applyFees(amountOut, params.feeRate, params.spread);
     }
 
     /**
@@ -490,6 +590,10 @@ contract PropAMM is Ownable, ReentrancyGuard {
         uint256 targetY = _getTargetY(pairId, params);
         uint256 maxRef = targetY > pair.targetYReference ? targetY : pair.targetYReference;
         pair.targetYReference = maxRef;
+
+        if (pair.targetYReference == 0) {
+            return false;
+        }
 
         // Lock if deviation exceeds 5%
         if (((pair.targetYReference - targetY) * 10000) / pair.targetYReference > 500) {
@@ -504,9 +608,18 @@ contract PropAMM is Ownable, ReentrancyGuard {
      */
     function _getTargetY(bytes32 pairId, PairParameters memory params) internal view returns (uint256) {
         TradingPair storage pair = pairs[pairId];
+        if (params.multY == 0) revert StaleParameters();
 
-        return
-            (pair.reserveX * params.multX + pair.reserveY * params.multY - pair.targetX * params.multX) / params.multY;
+        uint256 effectiveReserveX = _effectiveAmount(pair.reserveX, params.multX);
+        uint256 effectiveReserveY = _effectiveAmount(pair.reserveY, params.multY);
+        uint256 effectiveTargetX = _effectiveAmount(pair.targetX, params.multX);
+
+        if (effectiveReserveX + effectiveReserveY <= effectiveTargetX) {
+            return 0;
+        }
+
+        uint256 effectiveTargetY = effectiveReserveX + effectiveReserveY - effectiveTargetX;
+        return _reverseEffectiveAmount(effectiveTargetY, params.multY);
     }
 
     /**
@@ -522,6 +635,35 @@ contract PropAMM is Ownable, ReentrancyGuard {
         } else {
             return price * (10 ** (targetDecimals - priceDecimals));
         }
+    }
+
+    function _effectiveAmount(uint256 amount, uint256 multiplier) internal pure returns (uint256) {
+        return Math.mulDiv(amount, multiplier, MULTIPLIER_SCALE);
+    }
+
+    function _reverseEffectiveAmount(uint256 amount, uint256 multiplier) internal pure returns (uint256) {
+        if (multiplier == 0) revert InvalidAmount();
+        return Math.mulDiv(amount, MULTIPLIER_SCALE, multiplier);
+    }
+
+    function _adjustInputForConcentration(uint256 amount, uint256 concentration) internal pure returns (uint256) {
+        if (concentration < CONCENTRATION_BASE) revert InvalidConcentration();
+        return Math.mulDiv(amount, CONCENTRATION_BASE, concentration);
+    }
+
+    function _adjustOutputForConcentration(uint256 amount, uint256 concentration) internal pure returns (uint256) {
+        if (concentration < CONCENTRATION_BASE) revert InvalidConcentration();
+        return Math.mulDiv(amount, concentration, CONCENTRATION_BASE);
+    }
+
+    function _applyFees(uint256 amount, uint256 feeRate, uint256 spread) internal pure returns (uint256) {
+        if (feeRate == 0 && spread == 0) return amount;
+
+        uint256 totalRate = feeRate + spread;
+        if (totalRate > FEE_BASE) revert InvalidAmount();
+
+        uint256 feeAmount = Math.mulDiv(amount, totalRate, FEE_BASE);
+        return amount - feeAmount;
     }
 
     // ============ Admin Functions ============

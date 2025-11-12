@@ -80,6 +80,8 @@ contract PropAMMTest is Test {
     uint256 constant INITIAL_WETH_LIQUIDITY = 100 * 10 ** WETH_DECIMALS; // 100 WETH
     uint256 constant INITIAL_USDC_LIQUIDITY = 400000 * 10 ** USDC_DECIMALS; // 400,000 USDC
     uint256 constant WETH_PRICE = 4000; // 4000 USDC per WETH
+    uint256 constant CONCENTRATION_BASE = 1_000_000;
+    uint256 constant MULTIPLIER_SCALE = 1e18;
 
     function setUp() public {
         // Deploy mock tokens
@@ -107,13 +109,7 @@ contract PropAMMTest is Test {
         // Create WETH-USDC pair
         // decimalsX (18) + xRetainDecimals (0) = decimalsY (6) + yRetainDecimals (12)
         // 18 + 0 = 6 + 12 = 18
-        bytes32 pairId = amm.createPair(
-            address(weth),
-            address(usdc),
-            100, // initial concentration
-            0, // xRetainDecimals
-            12 // yRetainDecimals
-        );
+        bytes32 pairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
 
         vm.stopPrank();
 
@@ -130,13 +126,7 @@ contract PropAMMTest is Test {
 
         // Create WETH-USDC pair
         // decimalsX (18) + xRetainDecimals (0) = decimalsY (6) + yRetainDecimals (12)
-        wethUsdcPairId = amm.createPair(
-            address(weth),
-            address(usdc),
-            1, // low concentration for simpler curve
-            0, // xRetainDecimals
-            12 // yRetainDecimals
-        );
+        wethUsdcPairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
 
         // Approve tokens for deposit
         weth.approve(address(amm), INITIAL_WETH_LIQUIDITY);
@@ -145,19 +135,14 @@ contract PropAMMTest is Test {
         // Deposit liquidity: 100 WETH and 400,000 USDC (price = 4000 USDC/WETH)
         amm.deposit(wethUsdcPairId, INITIAL_WETH_LIQUIDITY, INITIAL_USDC_LIQUIDITY);
 
-        // Update parameters to set price to 4000 USDC per WETH
-        // For small swaps: amountOut ≈ K / base^2 * amountIn
-        // Where K = (targetX * concentration)^2 * multX / multY, base ≈ targetX * concentration
-        // We have targetX = 100 * 10^18, concentration = 1
-        // We want: 1 WETH (10^18) -> 4000 USDC (4000 * 10^6)
-        // Solving: 4000 * 10^6 = K / (10^20)^2 * 10^18 => K = 4 * 10^31
-        // K = (10^20)^2 * multX / multY => 4 * 10^31 = 10^40 * multX / multY
-        // => multX / multY = 4 * 10^-9
-        uint256 concentration = 1;
-        uint256 multX = 4000; // Price ratio numerator
-        uint256 multY = 10 ** 12; // Price ratio denominator (gives 4000/10^12 = 4*10^-9)
+        // Update parameters to use baseline concentration and unit multipliers.
+        // The deposited liquidity already encodes a 4000 USDC/WETH price via reserve ratio,
+        // so we keep multipliers at 1.0 (scaled by 1e18) and rely on the reserves to anchor the curve.
+        uint256 concentration = CONCENTRATION_BASE;
+        uint256 multX = MULTIPLIER_SCALE;
+        uint256 multY = MULTIPLIER_SCALE;
 
-        amm.updateParameters(wethUsdcPairId, concentration, multX, multY);
+        amm.updateParameters(wethUsdcPairId, concentration, multX, multY, 0, 0, 0);
 
         vm.stopPrank();
 
@@ -213,23 +198,17 @@ contract PropAMMTest is Test {
         // Setup: Create pair and add liquidity
         vm.startPrank(marketMaker);
 
-        wethUsdcPairId = amm.createPair(
-            address(weth),
-            address(usdc),
-            1, // Same concentration as test_SwapWETHForUSDC
-            0,
-            12
-        );
+        wethUsdcPairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
 
         weth.approve(address(amm), INITIAL_WETH_LIQUIDITY);
         usdc.approve(address(amm), INITIAL_USDC_LIQUIDITY);
         amm.deposit(wethUsdcPairId, INITIAL_WETH_LIQUIDITY, INITIAL_USDC_LIQUIDITY);
 
         // Use same parameters as test_SwapWETHForUSDC
-        uint256 concentration = 1;
-        uint256 multX = 4000;
-        uint256 multY = 10 ** 12;
-        amm.updateParameters(wethUsdcPairId, concentration, multX, multY);
+        uint256 concentration = CONCENTRATION_BASE;
+        uint256 multX = MULTIPLIER_SCALE;
+        uint256 multY = MULTIPLIER_SCALE;
+        amm.updateParameters(wethUsdcPairId, concentration, multX, multY, 0, 0, 0);
 
         vm.stopPrank();
 
@@ -261,7 +240,7 @@ contract PropAMMTest is Test {
     function test_OnlyMarketMakerCanDeposit() public {
         vm.startPrank(marketMaker);
 
-        wethUsdcPairId = amm.createPair(address(weth), address(usdc), 100, 0, 12);
+        wethUsdcPairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
 
         vm.stopPrank();
 
@@ -280,15 +259,15 @@ contract PropAMMTest is Test {
         // Setup pair with liquidity
         vm.startPrank(marketMaker);
 
-        wethUsdcPairId = amm.createPair(address(weth), address(usdc), 100, 0, 12);
+        wethUsdcPairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
         weth.approve(address(amm), INITIAL_WETH_LIQUIDITY);
         usdc.approve(address(amm), INITIAL_USDC_LIQUIDITY);
         amm.deposit(wethUsdcPairId, INITIAL_WETH_LIQUIDITY, INITIAL_USDC_LIQUIDITY);
 
-        uint256 concentration = 100;
-        uint256 multX = 4000 * 10 ** 6;
-        uint256 multY = 10 ** 18;
-        amm.updateParameters(wethUsdcPairId, concentration, multX, multY);
+        uint256 concentration = 2 * CONCENTRATION_BASE;
+        uint256 multX = MULTIPLIER_SCALE;
+        uint256 multY = MULTIPLIER_SCALE;
+        amm.updateParameters(wethUsdcPairId, concentration, multX, multY, 0, 0, 0);
 
         vm.stopPrank();
 
@@ -306,17 +285,38 @@ contract PropAMMTest is Test {
         vm.stopPrank();
     }
 
+    function test_SwapWithoutLiquidityGracefullyReverts() public {
+        vm.startPrank(marketMaker);
+
+        wethUsdcPairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
+
+        vm.stopPrank();
+
+        vm.startPrank(trader);
+
+        uint256 amountWETHIn = 1 * 10 ** WETH_DECIMALS;
+        weth.approve(address(amm), amountWETHIn);
+
+        vm.expectRevert(PropAMM.InsufficientLiquidity.selector);
+        amm.swapXtoY(wethUsdcPairId, amountWETHIn, 0);
+
+        vm.stopPrank();
+    }
+
     function test_ParameterUpdate() public {
         vm.startPrank(marketMaker);
 
-        wethUsdcPairId = amm.createPair(address(weth), address(usdc), 100, 0, 12);
+        wethUsdcPairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
 
         // Update to new concentration and multipliers
-        uint256 newConcentration = 150;
-        uint256 newMultX = 3500 * 10 ** 6;
-        uint256 newMultY = 10 ** 18;
+        uint256 newConcentration = 3 * CONCENTRATION_BASE;
+        uint256 newMultX = 35 * 10 ** 17; // 3.5x scale
+        uint256 newMultY = 12 * 10 ** 17; // 1.2x scale
+        uint256 newInvariant = 123456789;
+        uint256 feeRate = 1500; // 0.15%
+        uint256 spread = 500; // 0.05%
 
-        amm.updateParameters(wethUsdcPairId, newConcentration, newMultX, newMultY);
+        amm.updateParameters(wethUsdcPairId, newConcentration, newMultX, newMultY, newInvariant, feeRate, spread);
 
         // Verify parameters updated in global storage
         (PropAMM.PairParameters memory params, uint64 timestamp, uint64 blockNum) =
@@ -325,6 +325,9 @@ contract PropAMMTest is Test {
         assertEq(params.concentration, newConcentration);
         assertEq(params.multX, newMultX);
         assertEq(params.multY, newMultY);
+        assertEq(params.baseInvariant, newInvariant);
+        assertEq(params.feeRate, feeRate);
+        assertEq(params.spread, spread);
         assertEq(timestamp, block.timestamp);
         assertEq(blockNum, block.number);
 
@@ -334,7 +337,7 @@ contract PropAMMTest is Test {
     function test_WithdrawLiquidity() public {
         vm.startPrank(marketMaker);
 
-        wethUsdcPairId = amm.createPair(address(weth), address(usdc), 100, 0, 12);
+        wethUsdcPairId = amm.createPair(address(weth), address(usdc), CONCENTRATION_BASE, 0, 12);
 
         weth.approve(address(amm), INITIAL_WETH_LIQUIDITY);
         usdc.approve(address(amm), INITIAL_USDC_LIQUIDITY);
