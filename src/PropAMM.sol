@@ -56,6 +56,7 @@ contract PropAMM is Ownable, ReentrancyGuard {
 
     mapping(bytes32 => TradingPair) public pairs;
     bytes32[] public pairIds;
+    bool public tradingPaused;
 
     // ============ Mathematical Constants ============
 
@@ -100,6 +101,28 @@ contract PropAMM is Ownable, ReentrancyGuard {
         uint256 spread
     );
 
+    event CurveParametersUpdated(
+        bytes32 indexed pairId,
+        uint256 oldConcentration,
+        uint256 oldMultX,
+        uint256 oldMultY,
+        uint256 newConcentration,
+        uint256 newMultX,
+        uint256 newMultY
+    );
+
+    event SpreadUpdated(bytes32 indexed pairId, uint256 oldSpread, uint256 newSpread);
+
+    event LiquidityRebalanced(
+        bytes32 indexed pairId,
+        uint256 newTargetX,
+        uint256 newTargetY,
+        address indexed caller
+    );
+
+    event TradingPaused(address indexed account);
+    event TradingResumed(address indexed account);
+
     event PairUnlocked(bytes32 indexed pairId);
 
     // ============ Errors ============
@@ -114,6 +137,9 @@ contract PropAMM is Ownable, ReentrancyGuard {
     error SlippageExceeded();
     error InvalidDecimalConfiguration();
     error StaleParameters();
+    error TradingHalted();
+    error TradingAlreadyPaused();
+    error TradingNotPaused();
 
     // ============ Modifiers ============
 
@@ -230,6 +256,96 @@ contract PropAMM is Ownable, ReentrancyGuard {
     }
 
     /**
+     * @notice Update the core curve parameters while retaining other configuration values
+     * @dev Designed to be the primary hook for off-chain automation reacting to price changes
+     * @param pairId The pair identifier
+     * @param newMultX New multiplier for token X
+     * @param newMultY New multiplier for token Y
+     * @param newConcentration New concentration parameter
+     */
+    function updateCurveParams(
+        bytes32 pairId,
+        uint256 newMultX,
+        uint256 newMultY,
+        uint256 newConcentration
+    ) external onlyMarketMaker pairExists(pairId) {
+        if (newConcentration < CONCENTRATION_BASE || newConcentration > CONCENTRATION_BASE * 100) {
+            revert InvalidConcentration();
+        }
+
+        if (newMultX == 0 || newMultY == 0) revert InvalidAmount();
+
+        PairParameters memory current = _readParametersFromGlobalStorage(pairId);
+
+        _updateParametersInGlobalStorage(
+            pairId,
+            newConcentration,
+            newMultX,
+            newMultY,
+            current.baseInvariant,
+            current.feeRate,
+            current.spread
+        );
+
+        emit CurveParametersUpdated(
+            pairId,
+            current.concentration,
+            current.multX,
+            current.multY,
+            newConcentration,
+            newMultX,
+            newMultY
+        );
+    }
+
+    /**
+     * @notice Update only the spread parameter, keeping other parameters unchanged
+     * @param pairId The pair identifier
+     * @param newSpread New spread value (scaled by 1e6)
+     */
+    function setSpread(bytes32 pairId, uint256 newSpread) external onlyMarketMaker pairExists(pairId) {
+        if (newSpread > FEE_BASE) revert InvalidAmount();
+
+        PairParameters memory current = _readParametersFromGlobalStorage(pairId);
+        if (current.feeRate + newSpread > FEE_BASE) revert InvalidAmount();
+
+        _updateParametersInGlobalStorage(
+            pairId,
+            current.concentration,
+            current.multX,
+            current.multY,
+            current.baseInvariant,
+            current.feeRate,
+            newSpread
+        );
+
+        emit SpreadUpdated(pairId, current.spread, newSpread);
+    }
+
+    /**
+     * @notice Rebalance the target inventory tracked by the AMM
+     * @param pairId The pair identifier
+     * @param newTargetX Desired target amount of token X
+     * @param newTargetY Desired target amount of token Y used as reference for locking logic
+     */
+    function rebalanceLiquidity(
+        bytes32 pairId,
+        uint256 newTargetX,
+        uint256 newTargetY
+    ) external onlyMarketMaker pairExists(pairId) {
+        TradingPair storage pair = pairs[pairId];
+
+        if (newTargetX > pair.reserveX) revert InvalidAmount();
+        if (newTargetY > pair.reserveY) revert InvalidAmount();
+
+        pair.targetX = newTargetX;
+        pair.targetYReference = newTargetY;
+        pair.targetYBasedLock = false;
+
+        emit LiquidityRebalanced(pairId, newTargetX, newTargetY, msg.sender);
+    }
+
+    /**
      * @notice Deposit liquidity into a pair
      */
     function deposit(bytes32 pairId, uint256 amountX, uint256 amountY)
@@ -307,6 +423,8 @@ contract PropAMM is Ownable, ReentrancyGuard {
         nonReentrant
         returns (uint256 amountYOut)
     {
+        if (tradingPaused) revert TradingHalted();
+
         TradingPair storage pair = pairs[pairId];
 
         // Read latest parameters from GlobalStorage
@@ -348,6 +466,8 @@ contract PropAMM is Ownable, ReentrancyGuard {
         nonReentrant
         returns (uint256 amountXOut)
     {
+        if (tradingPaused) revert TradingHalted();
+
         TradingPair storage pair = pairs[pairId];
 
         // Read latest parameters from GlobalStorage
@@ -667,6 +787,24 @@ contract PropAMM is Ownable, ReentrancyGuard {
     }
 
     // ============ Admin Functions ============
+
+    /**
+     * @notice Pause trading across all pairs
+     */
+    function pauseTrading() external onlyOwner {
+        if (tradingPaused) revert TradingAlreadyPaused();
+        tradingPaused = true;
+        emit TradingPaused(msg.sender);
+    }
+
+    /**
+     * @notice Resume trading across all pairs
+     */
+    function resumeTrading() external onlyOwner {
+        if (!tradingPaused) revert TradingNotPaused();
+        tradingPaused = false;
+        emit TradingResumed(msg.sender);
+    }
 
     /**
      * @notice Update market maker address
