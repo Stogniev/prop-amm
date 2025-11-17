@@ -6,11 +6,12 @@ A **Proprietary Automated Market Maker** implementation in Solidity, inspired by
 
 PropAMM implements a proprietary market making model with the following key characteristics:
 
-- **Single Market Maker**: Only the designated market maker can add/remove liquidity
-- **Custom Pricing Curves**: Uses concentration parameters and multipliers for flexible pricing
-- **Frontrunning Protection**: Integrates with GlobalStorage to ensure parameter updates are atomic and read from the top of the block
-- **Safety Mechanisms**: Automatic pair locking when target deviation exceeds thresholds
-- **Multi-Token Support**: Create multiple trading pairs with different configurations
+- **Single Market Maker**: Only the designated market maker can add/remove liquidity.
+- **Custom Pricing Curves**: Uses concentration parameters and multipliers for flexible pricing.
+- **High-Frequency Curve Control**: Adds `updateCurveParams`, `setSpread`, and `rebalanceLiquidity` so the market maker can keep quotes aligned with off-chain signals.
+- **Frontrunning Protection**: Integrates with GlobalStorage to ensure parameter updates are atomic and read from the top of the block.
+- **Safety Mechanisms**: Automatic pair locking when target deviation exceeds thresholds, plus pausable trading.
+- **Multi-Token Support**: Create multiple trading pairs with different configurations.
 
 ## Key Features
 
@@ -45,16 +46,48 @@ PropAMM
 │   ├── deposit()
 │   ├── withdraw()
 │   ├── updateParameters()
+│   ├── updateCurveParams()
+│   ├── setSpread()
+│   ├── rebalanceLiquidity()
 │   └── unlock()
 ├── Trading Functions (public)
 │   ├── swapXtoY()
 │   └── swapYtoX()
+├── Admin Functions (owner)
+│   ├── pauseTrading()
+│   └── resumeTrading()
 └── View Functions
     ├── quoteXtoY()
     ├── quoteYtoX()
     ├── getParametersWithTimestamp()
+    ├── getAllPairIds()
     └── getPair()
 ```
+
+## Off-Chain Automation
+
+The repository includes a Python toolkit in [`offchain/`](offchain/README.md) inspired by the [Cryptocurrency-Price-Prediction](https://github.com/Dat-TG/Cryptocurrency-Price-Prediction) project. It provides:
+
+- **Feature Engineering & Modeling**: `offchain/prediction/data.py` and `offchain/prediction/model.py` to load OHLCV data, build indicators, and train lightweight ensemble predictors.
+- **Signal Translation**: `offchain/prediction/signal_engine.py` maps price and volatility forecasts into curve settings (`multX`, `multY`, `concentration`, `spread`).
+- **Transaction Bot**: `offchain/update_bot.py` signs and sends `updateCurveParams`, `setSpread`, and `rebalanceLiquidity` calls to keep on-chain quotes synced with external prices.
+
+Quick start:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r offchain/requirements.txt
+
+# Train a model and push updates
+python offchain/update_bot.py \
+  --pair-id 0x... \
+  --rpc-url https://your.node \
+  --private-key 0xYOUR_KEY \
+  --data data/your_ohlcv.csv
+```
+
+> The calling key must be authorized as the market maker. The script is intentionally lightweight so it can run in frequent intervals (e.g., every block on an L2).
 
 ## Smart Contract Details
 
