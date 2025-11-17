@@ -71,7 +71,6 @@ The repository includes a Python toolkit in [`offchain/`](offchain/README.md) in
 - **Feature Engineering & Modeling**: `offchain/prediction/data.py` and `offchain/prediction/model.py` to load OHLCV data, build indicators, and train lightweight ensemble predictors.
 - **Signal Translation**: `offchain/prediction/signal_engine.py` maps price and volatility forecasts into curve settings (`multX`, `multY`, `concentration`, `spread`).
 - **Transaction Bot**: `offchain/update_bot.py` signs and sends `updateCurveParams`, `setSpread`, and `rebalanceLiquidity` calls to keep on-chain quotes synced with external prices.
-- **Unified Demo**: `offchain/demo_unified.py` stitches the predictor and contract interface together with synthetic data, printing the encoded transactions that would be sent on-chain.
 
 Quick start:
 
