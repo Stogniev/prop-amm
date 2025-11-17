@@ -27,3 +27,13 @@ python offchain/update_bot.py \
 ```
 
 > **Note**: The script assumes a JSON-RPC endpoint compatible with `web3.py` and that the calling key is authorized as the market maker in the PropAMM contract. The default model is intentionally lightweight so it can be run frequently by an automated strategy; feel free to swap in more advanced architectures (e.g., LSTM/GRU) following the API exposed by `CryptoPricePredictor`.
+
+## Unified AMM + Prediction demo
+
+To see the full loop in action without hitting a live RPC endpoint, run the self-contained demo:
+
+```bash
+python offchain/demo_unified.py
+```
+
+The script synthesizes OHLCV data, trains the `CryptoPricePredictor`, derives a `CurveUpdatePlan` via `SignalEngine`, and prints the encoded transaction payloads (`updateCurveParams`, `setSpread`, and `rebalanceLiquidity` when applicable) that would be sent to `PropAMM`.
