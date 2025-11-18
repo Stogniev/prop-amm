@@ -59,6 +59,10 @@ class CryptoPricePredictor:
             raise ValueError("Frame must contain a 'target_return' column")
 
         features = frame.drop(columns=["target", "target_return"], errors="ignore")
+        features = features.select_dtypes(include=[np.number])
+        if features.empty:
+            raise ValueError("Feature frame must contain at least one numeric column")
+
         targets = frame["target_return"]
 
         if self._feature_columns is None:
