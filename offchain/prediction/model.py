@@ -85,7 +85,12 @@ class CryptoPricePredictor:
 
         self._model.fit(x_train_scaled, y_train)
         predictions = self._model.predict(x_val_scaled)
-        self._rmse = mean_squared_error(y_val, predictions, squared=False)
+        try:
+            # Newer sklearn exposes ``squared`` to return RMSE directly.
+            self._rmse = mean_squared_error(y_val, predictions, squared=False)
+        except TypeError:
+            # Older sklearn lacks the ``squared`` kwarg; compute RMSE manually.
+            self._rmse = float(np.sqrt(mean_squared_error(y_val, predictions)))
         self._is_fitted = True
 
     def predict_next(self, frame: pd.DataFrame) -> PredictionResult:
